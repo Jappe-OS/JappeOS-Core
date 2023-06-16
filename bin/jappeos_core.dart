@@ -18,21 +18,29 @@
 
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
+
+import 'package:jappeos_messaging/jappeos_messaging.dart';
 
 /// Core process name
 const String PRCSS_CORE_THIS = "jappeos_core";
 
 /// Login app process name
-const String PRCSS_LOGIN = "jappeos_login";
+const String PRCSS_LOGIN = "login/jappeos_login";
 
 /// Desktop app process name
-const String PRCSS_DESKTOP = "jappeos_desktop";
+const String PRCSS_DESKTOP = "desktop/jappeos_desktop";
 
 /// Crash handler app process name
-const String PRCSS_CRASH_HANDLE = "jappeos_crh";
+const String PRCSS_CRASH_HANDLE = "crh/jappeos_crh";
 
 /// A list of processes
-const List<String> PRCSS = [PRCSS_CORE_THIS, PRCSS_LOGIN, PRCSS_DESKTOP, PRCSS_CRASH_HANDLE];
+const List<String> PRCSS = [
+  PRCSS_CORE_THIS,
+  PRCSS_LOGIN,
+  PRCSS_DESKTOP,
+  PRCSS_CRASH_HANDLE
+];
 
 // Whether logged in or not
 bool _isLoggedIn = false;
@@ -43,65 +51,57 @@ Future<void> main(List<String> arguments) async {
   if (await _Core.isAppRunning(0)) {
     print("Already running! Exiting...");
     exit(0);
-  } else {
-    _Core.runProcess(1);
   }
 
-  String end = r"$end";
-  String from = r"$from";
+  // Application startup process;
 
-  final receivePipePath = "${Platform.executable}/pipe/core/";
+  _Core.runProcess(1);
 
-  // Create a named pipe (FIFO) for receiving messages
-  await Process.run('mkfifo', [receivePipePath]);
+  JappeOSMessaging.init(8888);
 
-  // Open the receive pipe for reading
-  final receivePipe = File(receivePipePath).openRead();
+  JappeOSMessaging.receive.subscribe((args) {
+    switch (args!.value1.name) {
+      case "login":
+        {
+          _Core.login(args.value1.args["u"] ?? "", args.value1.args["p"] ?? "");
+          break;
+        }
+      case "logout":
+        {
+          _Core.logout();
+          break;
+        }
+      case "logged-in":
+        {
+          JappeOSMessaging.send(Message("logged-in", {
+            "id": args.value1.args["id"] ?? "0",
+            "v": _Core.isLoggedIn().toString()
+          }), args.value2.remotePort); // TODO Send target
+          break;
+        }
+      case "shutdown":
+        {
+          _shouldQuit = true;
+          break;
+        }
+    }
+  });
+
+  // Loop to keep app running;
+
   while (!_shouldQuit) {
-    if (!_isLoggedIn && !await _Core.isAppRunning(1)) {
-      _Core.handleCrash(false);
-    }
-    if (_isLoggedIn && !await _Core.isAppRunning(2)) {
-      _Core.handleCrash(true);
-    }
-
-    final data = await receivePipe.first;
-    final message = utf8.decode(data).trim();
-    print('Received message: $message');
-
-    // Execute your function or perform desired actions based on the received message
-    if (message.startsWith("login ")) {
-      _Core.login(_Core.stringBetween(message, "u:", "p:") ?? "", _Core.stringBetween(message + end, "p:", end) ?? "");
-    }
-    if (message.startsWith("logout")) {
-      _Core.logout();
-    }
-    if (message.startsWith("logged-in ")) {
-      final sendPipePath = _Core.stringBetween(message + end, from, end);
-
-      // Open the send pipe for writing
-      final sendPipe = File(sendPipePath!).openWrite(mode: FileMode.append);
-
-      final send = 'logged-in v:${_Core.isLoggedIn()}';
-
-      // Write the message to the send pipe
-      sendPipe.writeln(send);
-      print('Sent message: $send');
-
-      // Close the send pipe
-      sendPipe.close();
-    }
-    if (message.startsWith("shutdown")) {
-      _shouldQuit = true;
-    }
+    await Future.delayed(Duration(milliseconds: 10));
   }
 
-  receivePipe.drain();
-  await Process.run('rm', [receivePipePath]);
+  // Cleanup functions below;
+
+  JappeOSMessaging.clean();
 
   for (int i = 0; i < PRCSS.length; i++) {
     _Core.killProcess(i);
   }
+
+  exit(0);
 }
 
 /// Class that contains basic functions for this app. Does not contain any data.
@@ -116,12 +116,51 @@ class _Core {
 
   /// Runs a JappeOS process.
   static Future<void> runProcess(int i, [List<String>? args]) async {
+    final receivePort = ReceivePort();
+
+    // Spawn a new isolate
+    await Isolate.spawn(_processRunner, {
+      'index': i,
+      'args': args,
+      'sendPort': receivePort.sendPort,
+    });
+
+    // Listen for messages from the isolate
+    await for (final message in receivePort) {
+      if (message is Map && message.containsKey('result')) {
+        final result = message['result'];
+        print("Process finished: ${PRCSS[i]} :: $result");
+
+        // Handle crash for login or dekstop process if exit code is not 0 (success).
+        if (result.exitCode != 0) {
+          // Login Crash
+          if (i == 1) {
+            handleCrash(false, result.exitCode);
+          }
+          // Desktop Crash
+          else if (i == 2) {
+            handleCrash(true, result.exitCode);
+          }
+        }
+      }
+    }
+  }
+
+  /// Handle JappeOS process run isolate.
+  static void _processRunner(Map<String, dynamic> data) async {
+    final int index = data['index'];
+    final List<String>? args = data['args'];
+    final SendPort sendPort = data['sendPort'];
+
     for (int j = 0; j < PRCSS.length; j++) {
-      if (j != i) killProcess(i);
+      if (j != index) {
+        killProcess(index);
+      }
     }
 
-    final result = await Process.run(PRCSS[i], args ?? []);
-    print("Process ran: ${PRCSS[i]} :: $result");
+    print("Starting process: ${PRCSS[index]}");
+    final result = await Process.run(PRCSS[index], args ?? []);
+    sendPort.send({'result': result});
   }
 
   /// Kills a JappeOS process.
@@ -136,7 +175,7 @@ class _Core {
   }
 
   /// Gets string between the first occurences of two strings.
-  /// 
+  ///
   /// Example: stringBetween("::Ymy string::F", "::Y", "::F")
   /// returns "my string".
   static String? stringBetween(String input, String start, String end) {
@@ -144,7 +183,8 @@ class _Core {
     final endIndex = input.indexOf(end);
 
     if (startIndex != -1 && endIndex != -1 && startIndex < endIndex) {
-      final extractedText = input.substring(startIndex + start.length, endIndex).trim();
+      final extractedText =
+          input.substring(startIndex + start.length, endIndex).trim();
       return extractedText;
     }
 
@@ -152,17 +192,16 @@ class _Core {
   }
 
   /// Handles a crash, pretty basic for now. TODO: Use exit code
-  static void handleCrash(bool b) {
+  /// b == true: PRCSS_DESKTOP
+  /// b == false: PRCSS_LOGIN
+  static void handleCrash(bool b, int i) {
     String target = b ? PRCSS_DESKTOP : PRCSS_LOGIN;
-    print("Crash detected! @ $target");
+    print("Crash detected! @ $target <> Code: $i");
     runProcess(3, [target]);
   }
 
   /// Log in using a username and a password.
   static Future<bool> login(String username, String password) async {
-    final username = 'your_username'; // Replace with your login username
-    final password = 'your_password'; // Replace with your login password
-
     // Start the shell process
     final process = await Process.start('/bin/sh', []);
 
@@ -184,7 +223,8 @@ class _Core {
     stdin.writeln(password);
 
     // Wait for the login result
-    final loginResult = await stdout.firstWhere((line) => line.contains('Login incorrect') || line.contains('Last login:'));
+    final loginResult = await stdout.firstWhere((line) =>
+        line.contains('Login incorrect') || line.contains('Last login:'));
 
     if (loginResult.contains('Login incorrect')) {
       print('Login failed.');
